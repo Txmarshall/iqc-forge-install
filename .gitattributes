@@ -1,0 +1,2 @@
+# Shell scripts MUST stay LF -- this repo is curl|bash'd on macOS/Linux.
+*.sh text eol=lf
