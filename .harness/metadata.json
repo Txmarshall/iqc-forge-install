@@ -1,0 +1,9 @@
+{
+  "schema": "harness-metadata/v1",
+  "repo": "iqc-forge-install",
+  "harness_memory": {
+    "enabled": true,
+    "repo_memory_path": "agent-memory/auto-memory",
+    "note": "Claude Code stores file-based harness memory at ~/.claude/projects/<slug>/memory/. iqc-skills bootstrap (Step 4c) junctions (Windows) / symlinks (POSIX) that path to <repo>/agent-memory/auto-memory so the memory is git-canonical and travels with the clone. The <slug> is computed by FORWARD-mangling the repo's absolute cwd (every non-alphanumeric char -> '-', e.g. C:\\Projects\\iqc-forge-install -> C--Projects-iqc-forge-install). It is NEVER reverse-engineered from the mangled dir name (ambiguous across drives/usernames/checkout roots). This file is the stable, machine-independent id bootstrap consumes; the slug is derived fresh per machine. Authority: iqc-af2 docs/decisions/2026-05-29-harness-memory-dual-write.md."
+  }
+}
