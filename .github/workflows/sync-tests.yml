@@ -1,0 +1,52 @@
+# sync-check v1
+# repo-sync test check. Installed by workstation/repo-sync/setup.mjs; edit the template, not this copy.
+# Runs on pull_request with a read-only token and no secrets. It can only fail a PR, never approve
+# a policy exception (that is sync-policy's job).
+name: sync-tests
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  sync-tests:
+    name: sync-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Conflict-marker scan
+        shell: bash
+        run: |
+          set -uo pipefail
+          if git grep -nE '^(<<<<<<<|>>>>>>>)( |$)'; then
+            echo '::error::conflict markers found'
+            exit 1
+          fi
+          echo 'no conflict markers'
+
+      - name: Gitleaks (PR commits)
+        uses: docker://zricethezav/gitleaks:v8.18.4
+        with:
+          args: detect --source=. --redact --no-banner --verbose --log-opts=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+
+      - name: Repo .sync-check
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f ./.sync-check ]; then
+            if [ -x ./.sync-check ]; then
+              ./.sync-check
+            else
+              echo '.sync-check present but not executable; skipped'
+            fi
+          else
+            echo 'no .sync-check'
+          fi
