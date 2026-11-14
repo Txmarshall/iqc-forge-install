@@ -2,8 +2,13 @@
 # repo-sync policy check. Installed by workstation/repo-sync/setup.mjs; edit the template, not this copy.
 # Runs on pull_request_target, so this file always comes from the BASE branch.
 # It NEVER checks out PR code. It reads the PR file list through the API with a read-only token.
-# The operator-approved label counts only on the run triggered by adding that label; any later
-# push (synchronize) or other label event re-fails a protected-path PR until the operator re-labels.
+# Base pinning: a PR is only checked against the default branch (pull_request_target runs the
+# BASE branch's workflow; a PR retargeted to another branch fails here, and `edited` re-runs it).
+# Approval: the operator-approved label passes the run it triggers. Later runs pass only by
+# carry-over: H0 = the PR head when the label was added (server push log, issue timeline), H0 must
+# be an ancestor of the head, no base change since, and no protected file the PR still changes was
+# touched after H0. So "update from main" keeps the approval; a new protected change, a force-push
+# or a rebase needs the label again. Every lookup failure means no carry-over.
 # Fail-closed: the PR head must not move while the file list is read and must equal the event's
 # head sha; the listed file count must reach changed_files (no lost page). Path matching ignores
 # case because the fleet's Windows/macOS checkouts do.
@@ -11,7 +16,7 @@ name: sync-policy
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
 
 permissions:
   contents: read
@@ -32,7 +37,14 @@ jobs:
           EVENT_ACTION: ${{ github.event.action }}
           EVENT_LABEL: ${{ github.event.label.name }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PROTECTED_JSON: '["timekeeping/",".github/",".sync-check","hooks/","workstation/repo-sync/","master.enc.yaml"]'
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          OPERATOR_LOGIN: ${{ github.repository_owner }}
+          EVENT_SENDER: ${{ github.event.sender.login }}
+          EVENT_SENDER_TYPE: ${{ github.event.sender.type }}
+          PROTECTED_JSON: '["timekeeping/",".github/",".sync-check","hooks/","master.enc.yaml"]'
         run: |
           set -euo pipefail
           meta='{head: .head.sha, changed_files: .changed_files}'
@@ -55,6 +67,9 @@ jobs:
               return null;
             }
           };
+          if (!process.env.DEFAULT_BRANCH || process.env.BASE_REF !== process.env.DEFAULT_BRANCH) {
+            fail('PR base is "' + process.env.BASE_REF + '", not the default branch "' + process.env.DEFAULT_BRANCH + '"; sync-policy only approves PRs into the default branch');
+          }
           const protectedList = JSON.parse(process.env.PROTECTED_JSON);
           const lines = fs.readFileSync(changedFile, 'utf8').split('\n').filter(Boolean);
           if (lines.length >= 3000) fail('PR lists 3000+ files (API cap); cannot verify protected paths');
@@ -86,7 +101,8 @@ jobs:
           }
           const labels = fs.readFileSync(labelsFile, 'utf8').split('\n').map((s) => s.trim()).filter(Boolean);
           const hasLabel = labels.includes('operator-approved');
-          const freshApproval = process.env.EVENT_ACTION === 'labeled' && process.env.EVENT_LABEL === 'operator-approved';
+          const freshApproval = process.env.EVENT_ACTION === 'labeled' && process.env.EVENT_LABEL === 'operator-approved'
+            && process.env.EVENT_SENDER_TYPE === 'User' && !!process.env.OPERATOR_LOGIN && process.env.EVENT_SENDER === process.env.OPERATOR_LOGIN;
           console.log('changed paths: ' + paths.length + '; protected hits: ' + hits.length);
           if (hits.length === 0) {
             console.log('sync-policy: no protected paths touched');
@@ -97,8 +113,70 @@ jobs:
             console.log('sync-policy: protected paths approved by the operator-approved label on this run');
             process.exit(0);
           }
+          // Carry-over. Returns the approved head H0, or null (fail closed) on any doubt.
+          const carryOver = () => {
+            try {
+              const { execFileSync } = require('child_process');
+              const api = (route, paginate) => {
+                const args = ['api', route].concat(paginate ? ['--paginate', '--slurp'] : []);
+                const raw = execFileSync('gh', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }); // gh-runner (tests patch this line)
+                const v = JSON.parse(raw);
+                return paginate ? [].concat(...v) : v;
+              };
+              const sha = /^[0-9a-f]{40}$/;
+              const head = after.head;
+              const headRef = process.env.HEAD_REF || '';
+              if (!sha.test(head) || process.env.HEAD_REPO !== process.env.REPO || !/^[A-Za-z0-9._\/-]{1,200}$/.test(headRef)) return null;
+              const timeline = api('repos/' + process.env.REPO + '/issues/' + process.env.PR_NUMBER + '/timeline?per_page=100', true);
+              const t = (s) => Date.parse(s);
+              // Only a label the repo owner added as a human counts: a label added by a workflow's
+              // GITHUB_TOKEN (github-actions[bot]) triggers no run of its own and must not approve.
+              const byOperator = (e) => e.actor && e.actor.type === 'User' && e.actor.login === process.env.OPERATOR_LOGIN;
+              const labeled = timeline.filter((e) => e && e.event === 'labeled' && e.label && e.label.name === 'operator-approved' && byOperator(e) && !isNaN(t(e.created_at)));
+              // The latest operator-approved label event of ANY actor must be the operator's.
+              const anyLabeled = timeline.filter((e) => e && e.event === 'labeled' && e.label && e.label.name === 'operator-approved' && !isNaN(t(e.created_at)));
+              if (!labeled.length || Math.max(...anyLabeled.map((e) => t(e.created_at))) !== Math.max(...labeled.map((e) => t(e.created_at)))) return null;
+              if (!labeled.length) return null;
+              const labelT = Math.max(...labeled.map((e) => t(e.created_at)));
+              if (timeline.some((e) => e && e.event === 'base_ref_changed' && !(t(e.created_at) < labelT))) return null;
+              const activity = api('repos/' + process.env.REPO + '/activity?ref=refs/heads/' + headRef + '&per_page=100', true);
+              const moves = activity.filter((a) => a && ['push', 'force_push', 'branch_creation'].includes(a.activity_type) && sha.test(a.after || '') && !isNaN(t(a.timestamp)));
+              if (moves.some((a) => Math.abs(t(a.timestamp) - labelT) <= 2000)) return null; // within 2 s of the label: ambiguous
+              const prior = moves.filter((a) => t(a.timestamp) < labelT).sort((x, y) => t(y.timestamp) - t(x.timestamp));
+              if (!prior.length) return null;
+              const h0 = prior[0].after;
+              if (h0 === head) return h0;
+              const cmp = api('repos/' + process.env.REPO + '/compare/' + h0 + '...' + head, false);
+              if (!cmp || cmp.status !== 'ahead' || !Array.isArray(cmp.files) || cmp.files.length >= 300) return null;
+              const touched = new Set();
+              for (const f of cmp.files) {
+                if (f && f.filename) touched.add(norm(f.filename));
+                if (f && f.previous_filename) touched.add(norm(f.previous_filename));
+              }
+              if (hits.some((h) => touched.has(norm(h)))) return null;
+              // Every protected file the PR changes now must have been in the approved diff at H0
+              // (blocks "merge main, then delete or revert a protected file main added").
+              const base = api('repos/' + process.env.REPO + '/compare/' + process.env.DEFAULT_BRANCH + '...' + h0, false);
+              if (!base || !['ahead', 'diverged'].includes(base.status) || !Array.isArray(base.files) || base.files.length >= 300) return null;
+              const approved = new Set();
+              for (const f of base.files) {
+                if (f && f.filename) approved.add(norm(f.filename));
+                if (f && f.previous_filename) approved.add(norm(f.previous_filename));
+              }
+              if (!hits.every((h) => approved.has(norm(h)))) return null;
+              return h0;
+            } catch (e) {
+              console.log('carry-over lookup failed: ' + String(e && e.message || e).split('\n')[0]);
+              return null;
+            }
+          };
           if (hasLabel) {
-            console.log('::error::operator-approved predates this event (' + process.env.EVENT_ACTION + '); remove and re-add the label to approve the current head');
+            const h0 = carryOver();
+            if (h0) {
+              console.log('sync-policy: approval carried over from ' + h0 + ' (head when operator-approved was added); no protected file changed since');
+              process.exit(0);
+            }
+            console.log('::error::operator-approved was added at a head this PR has since moved away from (a protected file changed, a force-push/rebase, or a base change); remove and re-add the label to approve the current head');
           } else {
             console.log('::error::protected paths need the operator-approved label (added by the operator)');
           }
